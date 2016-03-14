@@ -4,7 +4,7 @@
 #
 # localBuild - requires make release to have been run to build local binaries
 # packageManager - will install packages from your distribution using yum/dnf/apt
-source_type: localBuild
+source_type: packageManager
 
 # will be used as the Internal dns domain name if DNS is enabled. Services
 # will be discoverable under <service-name>.<namespace>.svc.<domainname>, e.g.
@@ -14,14 +14,14 @@ cluster_name: cluster.local
 # Account name of remote user. Ansible will use this user account to ssh into
 # the managed machines. The user must be able to use sudo without asking
 # for password unless ansible_sudo_pass is set
-#ansible_ssh_user: root
+ansible_ssh_user: user
 
 # password for the ansible_ssh_user. If this is unset you will need to set up
 # ssh keys so a password is not needed.
-#ansible_ssh_pass: password
+ansible_ssh_pass: password
 
 # If a password is needed to sudo to root that password must be set here
-#ansible_sudo_pass: password
+ansible_sudo_pass: password
 
 # A list of insecure registrys you might need to define
 insecure_registrys:
@@ -74,7 +74,7 @@ cluster_monitoring: true
 kube-ui: false
 
 # Turn to false to disable the kube-dash addon for this cluster
-kube-dash: false
+kube-dash: true
 
 # Turn this varable to 'false' to disable whole DNS configuration.
 dns_setup: true
