@@ -7,3 +7,5 @@ sd-kube-master-01.zepower.com
 [nodes]
 sd-kube-node-01.zepower.com
 sd-kube-node-02.zepower.com
+sd-kube-node-03.zepower.com
+sd-kube-node-04.zepower.com
