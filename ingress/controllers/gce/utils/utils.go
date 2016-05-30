@@ -18,10 +18,13 @@ package utils
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
+	"github.com/golang/glog"
 	compute "google.golang.org/api/compute/v1"
 	"google.golang.org/api/googleapi"
+	"regexp"
 )
 
 const (
@@ -46,9 +49,15 @@ const (
 
 	// This allows sharing of backends across loadbalancers.
 	backendPrefix = "k8s-be"
+	backendRegex  = "k8s-be-([0-9]+).*"
 
 	// Prefix used for instance groups involved in L7 balancing.
 	igPrefix = "k8s-ig"
+
+	// Suffix used in the l7 firewall rule. There is currently only one.
+	// Note that this name is used by the cloudprovider lib that inserts its
+	// own k8s-fw prefix.
+	globalFirewallSuffix = "l7"
 
 	// A delimiter used for clarity in naming GCE resources.
 	clusterNameDelimiter = "--"
@@ -93,15 +102,68 @@ func (n *Namer) decorateName(name string) string {
 	return n.Truncate(fmt.Sprintf("%v%v%v", name, clusterNameDelimiter, n.ClusterName))
 }
 
+// NameBelongsToCluster checks if a given name is tagged with this cluster's UID.
+func (n *Namer) NameBelongsToCluster(name string) bool {
+	if !strings.HasPrefix(name, "k8s-") {
+		glog.V(4).Infof("%v not part of cluster", name)
+		return false
+	}
+	parts := strings.Split(name, clusterNameDelimiter)
+	if len(parts) == 1 {
+		if n.ClusterName == "" {
+			return true
+		}
+		return false
+	}
+	if len(parts) > 2 {
+		glog.Warningf("Too many parts to name %v, ignoring", name)
+		return false
+	}
+	return parts[1] == n.ClusterName
+}
+
 // BeName constructs the name for a backend.
 func (n *Namer) BeName(port int64) string {
 	return n.decorateName(fmt.Sprintf("%v-%d", backendPrefix, port))
+}
+
+// BePort retrieves the port from the given backend name.
+func (n *Namer) BePort(beName string) (string, error) {
+	r, err := regexp.Compile(backendRegex)
+	if err != nil {
+		return "", err
+	}
+	match := r.FindStringSubmatch(beName)
+	if len(match) < 2 {
+		return "", fmt.Errorf("Unable to lookup port for %v", beName)
+	}
+	_, err = strconv.Atoi(match[1])
+	if err != nil {
+		return "", fmt.Errorf("Unexpected regex match: %v", beName)
+	}
+	return match[1], nil
 }
 
 // IGName constructs the name for an Instance Group.
 func (n *Namer) IGName() string {
 	// Currently all ports are added to a single instance group.
 	return n.decorateName(igPrefix)
+}
+
+// FrSuffix constructs the glbc specific suffix for the FirewallRule.
+func (n *Namer) FrSuffix() string {
+	// The entire cluster only needs a single firewall rule.
+	if n.ClusterName == "" {
+		return globalFirewallSuffix
+	}
+	return n.Truncate(fmt.Sprintf("%v%v%v", globalFirewallSuffix, clusterNameDelimiter, n.ClusterName))
+}
+
+// FrName constructs the full firewall rule name, this is the name assigned by
+// the cloudprovider lib + suffix from glbc, so we don't mix this rule with a
+// rule created for L4 loadbalancing.
+func (n *Namer) FrName(suffix string) string {
+	return fmt.Sprintf("k8s-fw-%s", suffix)
 }
 
 // LBName constructs a loadbalancer name from the given key. The key is usually

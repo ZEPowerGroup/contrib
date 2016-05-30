@@ -28,10 +28,11 @@ import (
 
 	flag "github.com/spf13/pflag"
 	"k8s.io/contrib/ingress/controllers/gce/controller"
+	"k8s.io/contrib/ingress/controllers/gce/storage"
 	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/unversioned"
 	client "k8s.io/kubernetes/pkg/client/unversioned"
 	kubectl_util "k8s.io/kubernetes/pkg/kubectl/cmd/util"
+	"k8s.io/kubernetes/pkg/labels"
 	"k8s.io/kubernetes/pkg/util/wait"
 
 	"github.com/golang/glog"
@@ -57,19 +58,16 @@ const (
 	alphaNumericChar = "0"
 
 	// Current docker image version. Only used in debug logging.
-	imageVersion = "glbc:0.6.0"
+	imageVersion = "glbc:0.6.3"
+
+	// Key used to persist UIDs to configmaps.
+	uidConfigMapName = "ingress-uid"
 )
 
 var (
 	flags = flag.NewFlagSet(
 		`gclb: gclb --runngin-in-cluster=false --default-backend-node-port=123`,
 		flag.ExitOnError)
-
-	proxyUrl = flags.String("proxy", "",
-		`If specified, the controller assumes a kubctl proxy server is running on the
-		given url and creates a proxy client and fake cluster manager. Results are
-		printed to stdout and no changes are made to your cluster. This flag is for
-		testing.`)
 
 	clusterName = flags.String("cluster-uid", controller.DefaultClusterUID,
 		`Optional, used to tag cluster wide, shared loadbalancer resources such
@@ -81,6 +79,13 @@ var (
 	inCluster = flags.Bool("running-in-cluster", true,
 		`Optional, if this controller is running in a kubernetes cluster, use the
 		 pod secrets for creating a Kubernetes client.`)
+
+	// TODO: Consolidate this flag and running-in-cluster. People already use
+	// the first one to mean "running in dev", unfortunately.
+	useRealCloud = flags.Bool("use-real-cloud", false,
+		`Optional, if set a real cloud client is created. Only matters with
+		 --running-in-cluster=false, i.e a real cloud is always used when this
+		 controller is running on a Kubernetes node.`)
 
 	resyncPeriod = flags.Duration("sync-period", 30*time.Second,
 		`Relist and confirm cloud resources this often.`)
@@ -105,6 +110,13 @@ var (
 
 	verbose = flags.Bool("verbose", false,
 		`If true, logs are displayed at V(4), otherwise V(2).`)
+
+	configFilePath = flags.String("config-file-path", "",
+		`Path to a file containing the gce config. If left unspecified this
+		controller only works with default zones.`)
+
+	healthzPort = flags.Int("healthz-port", lbApiPort,
+		`Port to run healthz server. Must match the health check port in yaml.`)
 )
 
 func registerHandlers(lbc *controller.LoadBalancerController) {
@@ -122,7 +134,7 @@ func registerHandlers(lbc *controller.LoadBalancerController) {
 		lbc.Stop(true)
 	})
 
-	glog.Fatal(http.ListenAndServe(fmt.Sprintf(":%v", lbApiPort), nil))
+	glog.Fatal(http.ListenAndServe(fmt.Sprintf(":%v", *healthzPort), nil))
 }
 
 func handleSigterm(lbc *controller.LoadBalancerController, deleteAll bool) {
@@ -156,30 +168,22 @@ func main() {
 		go_flag.Lookup("logtostderr").Value.Set("true")
 		go_flag.Set("v", "4")
 	}
-	glog.Infof("Starting GLBC image: %v", imageVersion)
+	glog.Infof("Starting GLBC image: %v, cluster name %v", imageVersion, *clusterName)
 	if *defaultSvc == "" {
 		glog.Fatalf("Please specify --default-backend")
 	}
 
-	if *proxyUrl != "" {
-		// Create proxy kubeclient
-		kubeClient = client.NewOrDie(&client.Config{
-			Host:          *proxyUrl,
-			ContentConfig: client.ContentConfig{GroupVersion: &unversioned.GroupVersion{Version: "v1"}},
-		})
-	} else {
-		// Create kubeclient
-		if *inCluster {
-			if kubeClient, err = client.NewInCluster(); err != nil {
-				glog.Fatalf("Failed to create client: %v.", err)
-			}
-		} else {
-			config, err := clientConfig.ClientConfig()
-			if err != nil {
-				glog.Fatalf("error connecting to the client: %v", err)
-			}
-			kubeClient, err = client.New(config)
+	// Create kubeclient
+	if *inCluster {
+		if kubeClient, err = client.NewInCluster(); err != nil {
+			glog.Fatalf("Failed to create client: %v.", err)
 		}
+	} else {
+		config, err := clientConfig.ClientConfig()
+		if err != nil {
+			glog.Fatalf("error connecting to the client: %v", err)
+		}
+		kubeClient, err = client.New(config)
 	}
 	// Wait for the default backend Service. There's no pretty way to do this.
 	parts := strings.Split(*defaultSvc, "/")
@@ -193,10 +197,13 @@ func main() {
 			*defaultSvc, err)
 	}
 
-	if *proxyUrl == "" && *inCluster {
+	if *inCluster || *useRealCloud {
 		// Create cluster manager
-		clusterManager, err = controller.NewClusterManager(
-			*clusterName, defaultBackendNodePort, *healthCheckPath)
+		name, err := getClusterUID(kubeClient, *clusterName)
+		if err != nil {
+			glog.Fatalf("%v", err)
+		}
+		clusterManager, err = controller.NewClusterManager(*configFilePath, name, defaultBackendNodePort, *healthCheckPath)
 		if err != nil {
 			glog.Fatalf("%v", err)
 		}
@@ -221,6 +228,60 @@ func main() {
 		glog.Infof("Handled quit, awaiting pod deletion.")
 		time.Sleep(30 * time.Second)
 	}
+}
+
+// getClusterUID returns the cluster UID. Rules for UID generation:
+// If the user specifies a --cluster-uid param it overwrites everything
+// else, check UID config map for a previously recorded uid
+// else, check if there are any working Ingresses
+//	- remember that "" is the cluster uid
+// else, allocate a new uid
+func getClusterUID(kubeClient *client.Client, name string) (string, error) {
+	cfgVault := storage.NewConfigMapVault(kubeClient, api.NamespaceSystem, uidConfigMapName)
+	if name != "" {
+		glog.Infof("Using user provided cluster uid %v", name)
+		// Don't save the uid in the vault, so users can rollback through
+		// --cluster-uid=""
+		return name, nil
+	}
+
+	existingUID, found, err := cfgVault.Get()
+	if found {
+		glog.Infof("Using saved cluster uid %q", name)
+		return existingUID, nil
+	} else if err != nil {
+		// This can fail because of:
+		// 1. No such config map - found=false, err=nil
+		// 2. No such key in config map - found=false, err=nil
+		// 3. Apiserver flake - found=false, err!=nil
+		// It is not safe to proceed in 3.
+		return "", fmt.Errorf("Failed to retrieve current uid: %v, using %q as name", err, name)
+	}
+
+	// Check if the cluster has an Ingress with ip
+	ings, err := kubeClient.Extensions().Ingress(api.NamespaceAll).List(api.ListOptions{LabelSelector: labels.Everything()})
+	if err != nil {
+		return "", err
+	}
+	for _, ing := range ings.Items {
+		if len(ing.Status.LoadBalancer.Ingress) != 0 {
+			glog.Infof("Found a working Ingress, assuming uid is empty string")
+			return "", cfgVault.Put("")
+		}
+	}
+
+	// Allocate new uid
+	f, err := os.Open("/dev/urandom")
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	b := make([]byte, 8)
+	if _, err := f.Read(b); err != nil {
+		return "", err
+	}
+	uid := fmt.Sprintf("%x", b)
+	return uid, cfgVault.Put(uid)
 }
 
 // getNodePort waits for the Service, and returns it's first node port.

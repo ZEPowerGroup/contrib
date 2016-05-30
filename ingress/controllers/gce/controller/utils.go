@@ -34,7 +34,10 @@ import (
 	"github.com/golang/glog"
 )
 
-const allowHTTPKey = "kubernetes.io/ingress.allowHTTP"
+const (
+	allowHTTPKey    = "kubernetes.io/ingress.allow-http"
+	staticIPNameKey = "kubernetes.io/ingress.global-static-ip-name"
+)
 
 // ingAnnotations represents Ingress annotations.
 type ingAnnotations map[string]string
@@ -50,6 +53,14 @@ func (ing ingAnnotations) allowHTTP() bool {
 		return true
 	}
 	return v
+}
+
+func (ing ingAnnotations) staticIPName() string {
+	val, ok := ing[staticIPNameKey]
+	if !ok {
+		return ""
+	}
+	return val
 }
 
 // errorNodePortNotFound is an implementation of error.
@@ -256,13 +267,13 @@ func (t *GCETranslator) getServiceNodePort(be extensions.IngressBackend, namespa
 	for _, p := range obj.(*api.Service).Spec.Ports {
 		switch be.ServicePort.Type {
 		case intstr.Int:
-			if p.Port == int(be.ServicePort.IntVal) {
-				nodePort = p.NodePort
+			if p.Port == be.ServicePort.IntVal {
+				nodePort = int(p.NodePort)
 				break
 			}
 		default:
 			if p.Name == be.ServicePort.StrVal {
-				nodePort = p.NodePort
+				nodePort = int(p.NodePort)
 				break
 			}
 		}

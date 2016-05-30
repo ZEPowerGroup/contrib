@@ -1,19 +1,28 @@
 "use strict";
-angular.module('SubmitQueueModule', ['ngMaterial', 'md.data.table', 'angular-toArrayFilter']);
+var app = angular.module('SubmitQueueModule', ['ngMaterial', 'md.data.table', 'angular-toArrayFilter', 'angularMoment']);
 
-angular.module('SubmitQueueModule').controller('SQCntl', ['DataService', '$interval', '$location', SQCntl]);
+app.config(['$compileProvider', function ($compileProvider) {
+  $compileProvider.debugInfoEnabled(false);
+}]);
+
+app.controller('SQCntl', ['DataService', '$interval', '$location', SQCntl]);
 
 function SQCntl(dataService, $interval, $location) {
   var self = this;
   self.prs = {};
   self.users = {};
   self.builds = {};
+  self.health = {};
+  self.lastMergeTime = Date();
   self.prQuerySearch = prQuerySearch;
   self.historyQuerySearch = historyQuerySearch;
   self.goToPerson = goToPerson;
   self.selectTab = selectTab;
+  self.tabLoaded = {};
+  self.functionLoading = {};
   self.queryNum = 0;
-  self.selected = 0;
+  self.selected = 1;
+  self.OverallHealth = "";
   self.StatOrder = "-Count";
   self.location = $location;
 
@@ -27,43 +36,95 @@ function SQCntl(dataService, $interval, $location) {
   if (path.length > 0) {
       switch (path) {
       case "/prs":
-	  self.selected=0;
-	  break;
+          self.selected=0;
+          break;
       case "/queue":
-	  self.selected=1;
-	  break;
+          self.selected=1;
+          break;
       case "/history":
-	  self.selected=2;
-	  break;
+          self.selected=2;
+          break;
       case "/e2e":
-	  self.selected=3;
-	  break;
+          self.selected=3;
+          break;
       case "/info":
-	  self.selected=4;
-	  break;
+          self.selected=4;
+          break;
       default:
-	  console.log("unknown path: " + path);
-	  break;
+          console.log("unknown path: " + path);
+          break;
       }
   }
 
-  // Refresh data every 10 minutes
-  refreshPRs();
-  $interval(refreshPRs, 600000);
+  loadTab(self.selected);
+
+  // Defer loading of data for a tab until it's actually needed.
+  // This speeds up the first-boot experience a LOT.
+  function loadTab() {
+    // reloadFunctions is a map from functions to how often they should run (in minutes)
+    var reloadFunctions = {}
+    reloadFunctions[refreshPRs] = 10;
+    reloadFunctions[refreshGithubE2E] = 0.5;
+    reloadFunctions[refreshSQStats] = 30;
+    reloadFunctions[refreshHistoryPRs] = 1;
+    reloadFunctions[refreshE2EHealth] = 10;
+    reloadFunctions[refreshUsers] = 15;
+    reloadFunctions[refreshBotStats] = 10;
+
+    // tabFunctionReloads is a map of which tabs need which functions to refresh
+    var tabFunctionReloads = {
+      0: [refreshPRs],
+      1: [refreshGithubE2E, refreshSQStats],
+      2: [refreshHistoryPRs],
+      3: [refreshE2EHealth, refreshSQStats],
+      4: [refreshSQStats, refreshUsers, refreshBotStats],
+    }
+    if (self.tabLoaded[self.selected]) {
+      return;
+    }
+    self.tabLoaded[self.selected] = true;
+
+    var reloadFuncs = tabFunctionReloads[self.selected];
+    if (reloadFuncs === undefined)
+      return;
+
+    for (var i = 0; i < reloadFuncs.length; i++) {
+      var func = reloadFuncs[i];
+      if (self.functionLoading[func] == true) {
+        continue;
+      }
+      self.functionLoading[func] = true;
+
+      var updateIntervalMinutes = reloadFunctions[func];
+      func();
+      $interval(func, updateIntervalMinutes * 60 * 1000);
+    }
+  }
+
+  // This data is shown in a top banner (when the Queue is blocked),
+  // so it's always loaded.
+  refreshGoogleInternalCI();
+  $interval(refreshGoogleInternalCI, 60000);  // Refresh every minute
+
+  // Request Avatars that are only as large necessary (CSS limits them to 40px)
+  function fixPRAvatars(prs) {
+    angular.forEach(prs, function(pr) {
+      if (/^https:\/\/avatars.githubusercontent.com\/u\/\d+\?v=3$/.test(pr.AvatarURL)) {
+        pr.AvatarURL += '&size=40';
+      }
+    });
+  }
 
   function refreshPRs() {
     dataService.getData('prs').then(function successCallback(response) {
       var prs = response.data.PRStatus;
+      fixPRAvatars(prs);
       self.prs = prs;
       self.prSearchTerms = getPRSearchTerms();
     }, function errorCallback(response) {
       console.log("Error: Getting SubmitQueue Status");
     });
   }
-
-  // Refresh every 30 seconds
-  refreshGithubE2E();
-  $interval(refreshGithubE2E, 30000);
 
   function refreshGithubE2E() {
     dataService.getData('github-e2e-queue').then(function successCallback(response) {
@@ -73,44 +134,31 @@ function SQCntl(dataService, $interval, $location) {
         self.e2erunning = [response.data.E2ERunning];
       }
       self.e2equeue = response.data.E2EQueue;
-      document.getElementById("queue-len").innerHTML = "&nbsp;(" + self.e2equeue.length + ")"
+      fixPRAvatars(self.e2equeue);
     });
   }
-
-  // Refresh every minute
-  refreshHistoryPRs();
-  $interval(refreshHistoryPRs, 60000);
 
   function refreshHistoryPRs() {
     dataService.getData('history').then(function successCallback(response) {
       var prs = response.data;
+      fixPRAvatars(prs);
       self.historyPRs = prs;
       self.historySearchTerms = getHistorySearchTerms();
     });
   }
 
-  // Refresh every 10 minutes
-  refreshStats();
-  $interval(refreshStats, 600000);
-
-  function refreshStats() {
-    dataService.getData('stats').then(function successCallback(response) {
-      var nextLoop = new Date(response.data.NextLoopTime);
-      document.getElementById("next-run-time").innerHTML = nextLoop.toLocaleTimeString();
-
-      self.botStats = response.data.Analytics;
-      self.APICount = response.data.APICount;
-      self.CachedAPICount = response.data.CachedAPICount;
-      document.getElementById("api-calls-per-sec").innerHTML = response.data.APIPerSec;
-      document.getElementById("github-api-limit-count").innerHTML = response.data.LimitRemaining;
-      var nextReset = new Date(response.data.LimitResetTime);
-      document.getElementById("github-api-limit-reset").innerHTML = nextReset.toLocaleTimeString();
+  function refreshSQStats() {
+    dataService.getData('sq-stats').then(function successCallback(response) {
+      self.sqStats = response.data;
+      self.lastMergeTime = new Date(response.data.LastMergeTime)
     });
   }
 
-  // Refresh every 15 minutes
-  refreshUsers();
-  $interval(refreshUsers, 900000);
+  function refreshBotStats() {
+    dataService.getData('stats').then(function successCallback(response) {
+      self.botStats = response.data;
+    });
+  }
 
   function refreshUsers() {
     dataService.getData('users').then(function successCallback(response) {
@@ -118,14 +166,22 @@ function SQCntl(dataService, $interval, $location) {
     });
   }
 
-  // Refresh every minute
-  refreshGoogleInternalCI();
-  $interval(refreshGoogleInternalCI, 60000);
+  function refreshE2EHealth() {
+    dataService.getData("health").then(function successCallback(response) {
+      self.health = response.data;
+      if (self.health.TotalLoops !== 0) {
+        var percentStable = self.health.NumStable * 100.0 / self.health.TotalLoops;
+        self.OverallHealth = Math.round(percentStable) + "%";
+      }
+      updateBuildStability(self.builds, self.health);
+    });
+  }
 
   function refreshGoogleInternalCI() {
     dataService.getData('google-internal-ci').then(function successCallback(response) {
       var result = getE2E(response.data);
       self.builds = result.builds;
+      updateBuildStability(self.builds, self.health);
       self.failedBuild = result.failedBuild;
     });
   }
@@ -153,12 +209,27 @@ function SQCntl(dataService, $interval, $location) {
         obj.msg = job.Status;
         failedBuild = true;
       }
+      obj.stability = '';
       result.push(obj);
     });
     return {
       builds: result,
       failedBuild: failedBuild,
     };
+  }
+
+  function updateBuildStability(builds, health) {
+    if (Object.keys(builds).length === 0 ||
+        health.TotalLoops === 0 || health.NumStablePerJob === undefined) {
+      return;
+    }
+    angular.forEach(builds, function(build) {
+      var key = build.name;
+      if (key in self.health.NumStablePerJob) {
+        var percentStable = health.NumStablePerJob[key] * 100.0 / health.TotalLoops;
+        build.stability = Math.round(percentStable) + "%"
+      }
+    });
   }
 
   function searchTermsContain(terms, value) {
@@ -237,12 +308,12 @@ function SQCntl(dataService, $interval, $location) {
   }
 
   function goToPerson(person) {
-    console.log(person);
     window.location.href = 'https://github.com/' + person;
   }
 
   function selectTab(tabName) {
     self.location.path('/' + tabName);
+    loadTab();
   }
 
   getPriorityInfo()
@@ -263,7 +334,7 @@ function SQCntl(dataService, $interval, $location) {
 }
 
 
-angular.module('SubmitQueueModule').filter('loginOrPR', function() {
+app.filter('loginOrPR', function() {
   return function(prs, searchVal) {
     searchVal = searchVal || "";
     prs = prs || [];
@@ -287,7 +358,7 @@ angular.module('SubmitQueueModule').filter('loginOrPR', function() {
   };
 });
 
-angular.module('SubmitQueueModule').service('DataService', ['$http', dataService]);
+app.service('DataService', ['$http', dataService]);
 
 function dataService($http) {
   return ({

@@ -37,7 +37,7 @@ var (
 )
 
 func docsProposalIssue() *github.Issue {
-	return github_test.Issue(botName, 1, []string{"cla: yes", "kind/design"}, true)
+	return github_test.Issue(botName, 1, []string{claYesLabel, "kind/design"}, true)
 }
 
 // Commit returns a filled out github.Commit which happened at time.Unix(t, 0)
@@ -142,7 +142,7 @@ func TestPathLabelMunge(t *testing.T) {
 		},
 	}
 	for testNum, test := range tests {
-		client, server, mux := github_test.InitServer(t, docsProposalIssue(), ValidPR(), test.events, test.commits, nil)
+		client, server, mux := github_test.InitServer(t, docsProposalIssue(), ValidPR(), test.events, test.commits, nil, nil)
 		mux.HandleFunc("/repos/o/r/issues/1/labels/kind/design", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte{})

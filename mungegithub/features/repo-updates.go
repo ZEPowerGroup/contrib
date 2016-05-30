@@ -94,26 +94,27 @@ func (o *RepoInfo) walkFunc(path string, info os.FileInfo, err error) error {
 
 	path, err = filepath.Rel(o.kubernetesDir, path)
 	if err != nil {
+		glog.Errorf("Unable to find relative path between %q and %q: %v", o.kubernetesDir, path, err)
 		return err
 	}
 	path = filepath.Dir(path)
-	o.assignees[path] = sets.NewString(c.Assignees...)
-	//o.owners[path] = sets.NewString(c.Assignees...)
+	if len(c.Assignees) > 0 {
+		o.assignees[path] = sets.NewString(c.Assignees...)
+	}
+	//if len(c.Owners) > 0 {
+	//o.owners[path] = sets.NewString(c.Owners...)
+	//}
 	return nil
 }
 
 func (o *RepoInfo) updateRepoUsers() error {
-	cmd := exec.Command("git", "pull")
-	cmd.Dir = o.kubernetesDir
-	out, err := cmd.CombinedOutput()
+	out, err := o.GitCommand([]string{"pull"})
 	if err != nil {
 		glog.Errorf("Unable to run git pull:\n%s\n%v", string(out), err)
 		return err
 	}
 
-	cmd = exec.Command("git", "rev-parse", "HEAD")
-	cmd.Dir = o.kubernetesDir
-	out, err = cmd.CombinedOutput()
+	out, err = o.GitCommand([]string{"rev-parse", "HEAD"})
 	if err != nil {
 		glog.Errorf("Unable get sha of HEAD:\n%s\n%v", string(out), err)
 		return err
@@ -155,12 +156,25 @@ func (o *RepoInfo) EachLoop() error {
 	if !o.enabled {
 		return nil
 	}
+
+	_, err := o.GitCommand([]string{"remote", "update"})
+	if err != nil {
+		glog.Errorf("Unable to git remote update: %v", err)
+	}
+
 	return o.updateRepoUsers()
 }
 
 // AddFlags will add any request flags to the cobra `cmd`
 func (o *RepoInfo) AddFlags(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&o.kubernetesDir, "kubernetes-dir", "./gitrepos/kubernetes", "Path to git checkout of kubernetes tree")
+}
+
+// GitCommand will execute the git command with the `args`
+func (o *RepoInfo) GitCommand(args []string) ([]byte, error) {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = o.kubernetesDir
+	return cmd.CombinedOutput()
 }
 
 func peopleForPath(path string, people map[string]sets.String, leafOnly bool) sets.String {

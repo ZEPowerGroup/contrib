@@ -18,6 +18,7 @@
   tags:
     - etcd
 
+# Install docker
 - hosts: all
   sudo: yes
   roles:
@@ -28,7 +29,6 @@
 
 # install flannel
 - hosts:
-    - etcd
     - masters
     - nodes
   sudo: yes
@@ -44,6 +44,12 @@
     - { role: opencontrail, when: networking == 'opencontrail'}
   tags:
     - network-service-install
+
+# install contiv netmaster
+- hosts: masters
+  sudo: yes
+  roles:
+    - { role: contiv, contiv_role: netmaster, when: networking == 'contiv' }
 
 # install kube master services
 - hosts: masters
@@ -79,3 +85,9 @@
     - { role: opencontrail-provision, when: networking == 'opencontrail' }
   tags:
     - network-service-config
+
+# install contiv netplugin
+- hosts: nodes
+  sudo: yes
+  roles:
+    - { role: contiv, contiv_role: netplugin, when: networking == 'contiv' }
