@@ -49,6 +49,10 @@ func NowStatus() *github.CombinedStatus {
 	return status
 }
 
+func OldStatus() *github.CombinedStatus {
+	return github_test.Status("mysha", []string{travisContext, jenkinsUnitContext, jenkinsE2EContext}, nil, nil, nil)
+}
+
 func TestOldUnitTestMunge(t *testing.T) {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
@@ -60,7 +64,7 @@ func TestOldUnitTestMunge(t *testing.T) {
 		{
 			name:     "Test0",
 			tested:   true,
-			ciStatus: SuccessStatus(), // Ran at time.Unix(0,0)
+			ciStatus: OldStatus(), // Ran at time.Unix(0,0)
 		},
 		{
 			name:     "Test1",
@@ -72,7 +76,7 @@ func TestOldUnitTestMunge(t *testing.T) {
 		issueNum := testNum + 1
 		tested := false
 
-		issue := NoOKToMergeIssue()
+		issue := LGTMIssue()
 		issue.Number = intPtr(issueNum)
 		pr := ValidPR()
 		pr.Number = intPtr(issueNum)

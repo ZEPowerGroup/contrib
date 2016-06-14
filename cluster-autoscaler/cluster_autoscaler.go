@@ -18,7 +18,9 @@ package main
 
 import (
 	"flag"
+	"net/http"
 	"net/url"
+	"os"
 	"time"
 
 	"k8s.io/contrib/cluster-autoscaler/config"
@@ -29,29 +31,39 @@ import (
 	kube_client "k8s.io/kubernetes/pkg/client/unversioned"
 
 	"github.com/golang/glog"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 var (
 	migConfigFlag           config.MigConfigFlag
+	address                 = flag.String("address", ":8085", "The address to expose prometheus metrics.")
 	kubernetes              = flag.String("kubernetes", "", "Kuberentes master location. Leave blank for default")
+	cloudConfig             = flag.String("cloud-config", "", "The path to the cloud provider configuration file.  Empty string for no configuration file.")
 	verifyUnschedulablePods = flag.Bool("verify-unschedulable-pods", true,
 		"If enabled CA will ensure that each pod marked by Scheduler as unschedulable actually can't be scheduled on any node."+
 			"This prevents from adding unnecessary nodes in situation when CA and Scheduler have different configuration.")
-	scaleDownEnabled = flag.Bool("experimental-scale-down-enabled", false, "Should CA scale down the cluster")
+	scaleDownEnabled = flag.Bool("scale-down-enabled", true, "Should CA scale down the cluster")
 	scaleDownDelay   = flag.Duration("scale-down-delay", 10*time.Minute,
 		"Duration from the last scale up to the time when CA starts to check scale down options")
-	scaleDownUnderutilizedTime = flag.Duration("scale-down-underutilized-time", 10*time.Minute,
-		"How long the node should be underutilized before it is eligible for scale down")
+	scaleDownUnneededTime = flag.Duration("scale-down-unneeded-time", 10*time.Minute,
+		"How long the node should be unneeded before it is eligible for scale down")
 	scaleDownUtilizationThreshold = flag.Float64("scale-down-utilization-threshold", 0.5,
-		"Node reservation level below which a node can be considered for scale down")
-	scaleDownTrialFrequency = flag.Duration("scale-down-trial-frequency", 10*time.Minute,
+		"Node utilization level, defined as sum of requested resources divided by capacity, below which a node can be considered for scale down")
+	scaleDownTrialInterval = flag.Duration("scale-down-trial-interval", 1*time.Minute,
 		"How often scale down possiblity is check")
+	scanInterval = flag.Duration("scan-interval", 10*time.Second, "How often cluster is reevaluated for scale up or down")
 )
 
 func main() {
 	flag.Var(&migConfigFlag, "nodes", "sets min,max size and url of a MIG to be controlled by Cluster Autoscaler. "+
 		"Can be used multiple times. Format: <min>:<max>:<migurl>")
 	flag.Parse()
+
+	go func() {
+		http.Handle("/metrics", prometheus.Handler())
+		err := http.ListenAndServe(*address, nil)
+		glog.Fatalf("Failed to start metrics: %v", err)
+	}()
 
 	url, err := url.Parse(*kubernetes)
 	if err != nil {
@@ -68,7 +80,18 @@ func main() {
 		migConfigs = append(migConfigs, &migConfigFlag[i])
 	}
 
-	gceManager, err := gce.CreateGceManager(migConfigs)
+	// GCE Manager
+	var gceManager *gce.GceManager
+	if *cloudConfig != "" {
+		config, err := os.Open(*cloudConfig)
+		if err != nil {
+			glog.Fatalf("Couldn't open cloud provider configuration %s: %#v", *cloudConfig, err)
+		}
+		defer config.Close()
+		gceManager, err = gce.CreateGceManager(migConfigs, config)
+	} else {
+		gceManager, err = gce.CreateGceManager(migConfigs, nil)
+	}
 	if err != nil {
 		glog.Fatalf("Failed to create GCE Manager: %v", err)
 	}
@@ -85,7 +108,7 @@ func main() {
 
 	lastScaleUpTime := time.Now()
 	lastScaleDownFailedTrial := time.Now()
-	underutilizedNodes := make(map[string]time.Time)
+	unneededNodes := make(map[string]time.Time)
 
 	eventBroadcaster := kube_record.NewBroadcaster()
 	eventBroadcaster.StartLogging(glog.Infof)
@@ -94,8 +117,11 @@ func main() {
 
 	for {
 		select {
-		case <-time.After(time.Minute):
+		case <-time.After(*scanInterval):
 			{
+				loopStart := time.Now()
+				updateLastTime("main")
+
 				nodes, err := nodeLister.List()
 				if err != nil {
 					glog.Errorf("Failed to list nodes: %v", err)
@@ -148,6 +174,7 @@ func main() {
 					newUnschedulablePodsToHelp := FilterOutSchedulable(unschedulablePodsToHelp, nodes, allScheduled, predicateChecker)
 
 					if len(newUnschedulablePodsToHelp) != len(unschedulablePodsToHelp) {
+						glog.V(2).Info("Schedulable pods present")
 						schedulablePodsPresent = true
 					}
 					unschedulablePodsToHelp = newUnschedulablePodsToHelp
@@ -156,7 +183,12 @@ func main() {
 				if len(unschedulablePodsToHelp) == 0 {
 					glog.V(1).Info("No unschedulable pods")
 				} else {
+					scaleUpStart := time.Now()
+					updateLastTime("scaleup")
 					scaledUp, err := ScaleUp(unschedulablePodsToHelp, nodes, migConfigs, gceManager, kubeClient, predicateChecker, recorder)
+
+					updateDuration("scaleup", scaleUpStart)
+
 					if err != nil {
 						glog.Errorf("Failed to scale up: %v", err)
 						continue
@@ -170,40 +202,77 @@ func main() {
 				}
 
 				if *scaleDownEnabled {
+					unneededStart := time.Now()
+
 					// In dry run only utilization is updated
-					calculateUtilizationOnly := lastScaleUpTime.Add(*scaleDownDelay).After(time.Now()) ||
-						lastScaleDownFailedTrial.Add(*scaleDownTrialFrequency).After(time.Now()) ||
+					calculateUnneededOnly := lastScaleUpTime.Add(*scaleDownDelay).After(time.Now()) ||
+						lastScaleDownFailedTrial.Add(*scaleDownTrialInterval).After(time.Now()) ||
 						schedulablePodsPresent
 
-					underutilizedNodes = CalculateUnderutilizedNodes(
+					glog.V(4).Infof("Scale down status: unneededOnly=%v lastScaleUpTime=%s "+
+						"lastScaleDownFailedTrail=%s schedulablePodsPresent=%v", calculateUnneededOnly,
+						lastScaleUpTime, lastScaleDownFailedTrial, schedulablePodsPresent)
+
+					updateLastTime("findUnneeded")
+					glog.V(4).Infof("Calculating unneded nodes")
+
+					unneededNodes = FindUnneededNodes(
 						nodes,
-						underutilizedNodes,
+						unneededNodes,
 						*scaleDownUtilizationThreshold,
 						allScheduled,
-						kubeClient,
 						predicateChecker)
 
-					if !calculateUtilizationOnly {
+					updateDuration("findUnneeded", unneededStart)
+
+					for key, val := range unneededNodes {
+						if glog.V(4) {
+							glog.V(4).Infof("%s is unneeded since %s duration %s", key, val.String(), time.Now().Sub(val).String())
+						}
+					}
+
+					if !calculateUnneededOnly {
+						glog.V(4).Infof("Starting scale down")
+
+						scaleDownStart := time.Now()
+						updateLastTime("scaledown")
+
 						result, err := ScaleDown(
 							nodes,
-							underutilizedNodes,
-							*scaleDownUnderutilizedTime,
+							unneededNodes,
+							*scaleDownUnneededTime,
 							allScheduled,
 							gceManager, kubeClient, predicateChecker)
+
+						updateDuration("scaledown", scaleDownStart)
+
+						// TODO: revisit result handling
 						if err != nil {
 							glog.Errorf("Failed to scale down: %v", err)
 						} else {
 							if result == ScaleDownNodeDeleted {
-								// Clean the utilization map to be super sure that the simulated
+								// Clean the map with unneeded nodes to be super sure that the simulated
 								// deletions are made in the new context.
-								underutilizedNodes = make(map[string]time.Time, len(underutilizedNodes))
+								unneededNodes = make(map[string]time.Time, len(unneededNodes))
 							} else {
-								lastScaleDownFailedTrial = time.Now()
+								if result == ScaleDownError || result == ScaleDownNoNodeDeleted {
+									lastScaleDownFailedTrial = time.Now()
+								}
 							}
 						}
 					}
 				}
+				updateDuration("main", loopStart)
 			}
 		}
 	}
+}
+
+func updateDuration(label string, start time.Time) {
+	duration.WithLabelValues(label).Observe(durationToMicro(start))
+	lastDuration.WithLabelValues(label).Set(durationToMicro(start))
+}
+
+func updateLastTime(label string) {
+	lastTimestamp.WithLabelValues(label).Set(float64(time.Now().Unix()))
 }

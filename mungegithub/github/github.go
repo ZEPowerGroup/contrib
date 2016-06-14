@@ -42,9 +42,8 @@ import (
 
 const (
 	// stolen from https://groups.google.com/forum/#!msg/golang-nuts/a9PitPAHSSU/ziQw1-QHw3EJ
-	maxInt          = int(^uint(0) >> 1)
-	tokenLimit      = 500 // How many github api tokens to not use
-	asyncTokenLimit = 400 // How many github api tokens to not use for 'asyc' calls
+	maxInt     = int(^uint(0) >> 1)
+	tokenLimit = 250 // How many github api tokens to not use
 
 	// Unit tests take over an hour now...
 	prMaxWaitTime = 2 * time.Hour
@@ -90,15 +89,10 @@ func (c *callLimitRoundTripper) getToken() {
 	c.getTokenExcept(tokenLimit)
 }
 
-func (c *callLimitRoundTripper) getAsyncToken() {
-	c.getTokenExcept(asyncTokenLimit)
-}
-
 func (c *callLimitRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	if c.delegate == nil {
 		c.delegate = http.DefaultTransport
 	}
-	// TODO Be smart about which should use getToken and which should use getAsyncToken()
 	c.getToken()
 	resp, err := c.delegate.RoundTrip(req)
 	c.Lock()
@@ -498,15 +492,16 @@ func (config *Config) GetObject(num int) (*MungeObject, error) {
 
 // NewIssue will file a new issue and return an object for it.
 func (config *Config) NewIssue(title, body string, labels []string) (*MungeObject, error) {
+	config.analytics.CreateIssue.Call(config, nil)
+	glog.Infof("Creating an issue: %q", title)
 	if config.DryRun {
 		return nil, fmt.Errorf("can't make issues in dry-run mode")
 	}
-	issue, resp, err := config.client.Issues.Create(config.Org, config.Project, &github.IssueRequest{
+	issue, _, err := config.client.Issues.Create(config.Org, config.Project, &github.IssueRequest{
 		Title:  &title,
 		Body:   &body,
 		Labels: &labels,
 	})
-	config.analytics.CreateIssue.Call(config, resp)
 	if err != nil {
 		glog.Errorf("createIssue: %v", err)
 		return nil, err
@@ -599,7 +594,7 @@ func (obj *MungeObject) LabelTime(label string) *time.Time {
 // LabelCreator returns the login name of the user who (last) created the given label
 func (obj *MungeObject) LabelCreator(label string) string {
 	event := obj.labelEvent(label)
-	if event == nil {
+	if event == nil || event.Actor == nil || event.Actor.Login == nil {
 		return ""
 	}
 	return *event.Actor.Login

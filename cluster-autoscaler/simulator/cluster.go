@@ -17,6 +17,7 @@ limitations under the License.
 package simulator
 
 import (
+	"flag"
 	"fmt"
 	"math"
 
@@ -27,6 +28,14 @@ import (
 	"k8s.io/kubernetes/plugin/pkg/scheduler/schedulercache"
 
 	"github.com/golang/glog"
+)
+
+var (
+	skipNodesWithSystemPods = flag.Bool("skip-nodes-with-system-pods", true,
+		"If true cluster autoscaler will never delete nodes with pods from kube-system (except for DeamonSet "+
+			"or mirror pods)")
+	skipNodesWithLocalStorage = flag.Bool("skip-nodes-with-local-storage", true,
+		"If true cluster autoscaler will never delete nodes with pods with local storage, e.g. EmptyDir or HostPath")
 )
 
 // FindNodesToRemove finds nodes that can be removed.
@@ -42,24 +51,36 @@ func FindNodesToRemove(candidates []*kube_api.Node, allNodes []*kube_api.Node, p
 	}
 	result := make([]*kube_api.Node, 0)
 
+	evaluationType := "Detailed evaluation"
+	if fastCheck {
+		evaluationType = "Fast evaluation"
+	}
+
 candidateloop:
 	for _, node := range candidates {
-		glog.V(2).Infof("Considering %s for removal", node.Name)
+		glog.V(2).Infof("%s: %s for removal", evaluationType, node.Name)
 
 		var podsToRemove []*kube_api.Pod
 		var err error
 
 		if fastCheck {
 			if nodeInfo, found := nodeNameToNodeInfo[node.Name]; found {
-				podsToRemove, err = FastGetPodsToMove(nodeInfo, false, true, kube_api.Codecs.UniversalDecoder())
+				podsToRemove, err = FastGetPodsToMove(nodeInfo, false, *skipNodesWithSystemPods, *skipNodesWithLocalStorage, kube_api.Codecs.UniversalDecoder())
+				if err != nil {
+					glog.V(2).Infof("%s: node %s cannot be removed: %v", evaluationType, node.Name, err)
+					continue candidateloop
+				}
+			} else {
+				glog.V(2).Infof("%s: nodeInfo for %s not found", evaluationType, node.Name)
+				continue candidateloop
 			}
 		} else {
 			drainResult, _, _, err := cmd.GetPodsForDeletionOnNodeDrain(client, node.Name,
 				kube_api.Codecs.UniversalDecoder(), false, true)
 
 			if err != nil {
-				glog.V(2).Infof("Node %s cannot be removed: %v", node.Name, err)
-				continue
+				glog.V(2).Infof("%s: node %s cannot be removed: %v", evaluationType, node.Name, err)
+				continue candidateloop
 			}
 			podsToRemove = make([]*kube_api.Pod, 0, len(drainResult))
 			for i := range drainResult {
@@ -69,30 +90,31 @@ candidateloop:
 		findProblems := findPlaceFor(node.Name, podsToRemove, allNodes, nodeNameToNodeInfo, predicateChecker)
 		if findProblems == nil {
 			result = append(result, node)
+			glog.V(2).Infof("%s: node %s may be removed", evaluationType, node.Name)
 			if len(result) >= maxCount {
 				break candidateloop
 			}
 		} else {
-			glog.V(2).Infof("Node %s is not suitable for removal %v", node.Name, err)
+			glog.V(2).Infof("%s: node %s is not suitable for removal %v", evaluationType, node.Name, err)
 		}
 	}
 	return result, nil
 }
 
-// CalculateReservation calculates reservation of a node.
-func CalculateReservation(node *kube_api.Node, nodeInfo *schedulercache.NodeInfo) (float64, error) {
-	cpu, err := calculateReservationOfResource(node, nodeInfo, kube_api.ResourceCPU)
+// CalculateUtilization calculates utilization of a node, defined as total amount of requested resources divided by capacity.
+func CalculateUtilization(node *kube_api.Node, nodeInfo *schedulercache.NodeInfo) (float64, error) {
+	cpu, err := calculateUtilizationOfResource(node, nodeInfo, kube_api.ResourceCPU)
 	if err != nil {
 		return 0, err
 	}
-	mem, err := calculateReservationOfResource(node, nodeInfo, kube_api.ResourceMemory)
+	mem, err := calculateUtilizationOfResource(node, nodeInfo, kube_api.ResourceMemory)
 	if err != nil {
 		return 0, err
 	}
 	return math.Max(cpu, mem), nil
 }
 
-func calculateReservationOfResource(node *kube_api.Node, nodeInfo *schedulercache.NodeInfo, resourceName kube_api.ResourceName) (float64, error) {
+func calculateUtilizationOfResource(node *kube_api.Node, nodeInfo *schedulercache.NodeInfo, resourceName kube_api.ResourceName) (float64, error) {
 	nodeCapacity, found := node.Status.Capacity[resourceName]
 	if !found {
 		return 0, fmt.Errorf("Failed to get %v from %s", resourceName, node.Name)
@@ -126,7 +148,7 @@ func findPlaceFor(bannedNode string, pods []*kube_api.Pod, nodes []*kube_api.Nod
 		glog.V(4).Infof("Looking for place for %s/%s", pod.Namespace, pod.Name)
 		podKey := fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
 
-		// TODO: Sort nodes by reservation
+		// TODO: Sort nodes by utilization
 	nodeloop:
 		for _, node := range nodes {
 			if node.Name == bannedNode {

@@ -22,15 +22,15 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 
 	cache "k8s.io/contrib/mungegithub/mungers/flakesync"
-	"k8s.io/contrib/mungegithub/mungers/jenkins"
 	"k8s.io/contrib/test-utils/utils"
 	"k8s.io/kubernetes/pkg/util/sets"
 
 	"github.com/golang/glog"
-	"strings"
+	"io/ioutil"
 )
 
 // E2ETester can be queried for E2E job stability.
@@ -38,7 +38,6 @@ type E2ETester interface {
 	GCSBasedStable() (stable, ignorableFlakes bool)
 	GCSWeakStable() bool
 	GetBuildStatus() map[string]BuildInfo
-	Stable() bool
 	Flakes() cache.Flakes
 }
 
@@ -48,23 +47,38 @@ type BuildInfo struct {
 	ID     string
 }
 
-// RealE2ETester is the object which will contact a jenkins instance and get
+// RealE2ETester is the object which will get status from a google bucket
 // information about recent jobs
 type RealE2ETester struct {
-	JenkinsHost        string
-	JobNames           []string
-	WeakStableJobNames []string
+	BlockingJobNames    []string
+	NonBlockingJobNames []string
+	WeakStableJobNames  []string
 
 	sync.Mutex
 	BuildStatus          map[string]BuildInfo // protect by mutex
 	GoogleGCSBucketUtils *utils.Utils
 
-	flakeCache *cache.Cache
+	flakeCache        *cache.Cache
+	resolutionTracker *ResolutionTracker
+}
+
+// HTTPHandlerInstaller is anything that can hook up HTTP requests to handlers.
+// Used for installing admin functions.
+type HTTPHandlerInstaller interface {
+	HandleFunc(pattern string, handler func(http.ResponseWriter, *http.Request))
 }
 
 // Init does construction-- call once it after setting the public fields of 'e'.
-func (e *RealE2ETester) Init() *RealE2ETester {
+// adminMux may be nil, in which case handlers for the resolution tracker won't
+// be installed.
+func (e *RealE2ETester) Init(adminMux HTTPHandlerInstaller) *RealE2ETester {
 	e.flakeCache = cache.NewCache(e.getGCSResult)
+	e.resolutionTracker = NewResolutionTracker()
+	if adminMux != nil {
+		adminMux.HandleFunc("/api/mark-resolved", e.resolutionTracker.SetHTTP)
+		adminMux.HandleFunc("/api/is-resolved", e.resolutionTracker.GetHTTP)
+		adminMux.HandleFunc("/api/list-resolutions", e.resolutionTracker.ListHTTP)
+	}
 	return e
 }
 
@@ -95,33 +109,6 @@ func (e *RealE2ETester) setBuildStatus(build, status string, id string) {
 	e.Lock()
 	defer e.Unlock()
 	e.BuildStatus[build] = BuildInfo{Status: status, ID: id}
-}
-
-// Stable is called to make sure all of the jenkins jobs are stable
-// TODO: deprecated; GCS version is better. Use that only. Delete this.
-func (e *RealE2ETester) Stable() bool {
-	// Test if the build is stable in Jenkins
-	jenkinsClient := &jenkins.JenkinsClient{Host: e.JenkinsHost}
-
-	allStable := true
-	for _, job := range e.JobNames {
-		glog.V(2).Infof("Checking build stability for %s", job)
-		build, err := jenkinsClient.GetLastCompletedBuild(job)
-		if err != nil {
-			glog.Errorf("Error checking job %v : %v", job, err)
-			e.setBuildStatus(job, "Error checking: "+err.Error(), "0")
-			allStable = false
-			continue
-		}
-		if build.IsStable() {
-			e.setBuildStatus(job, "Stable", build.ID)
-		} else {
-			e.setBuildStatus(job, "Not Stable", build.ID)
-			glog.Infof("Jenkis based check for %v build %v returned false", job, build.ID)
-			allStable = false
-		}
-	}
-	return allStable
 }
 
 const (
@@ -158,6 +145,11 @@ func (e *RealE2ETester) getGCSResult(j cache.Job, n cache.Number) (*cache.Result
 	}
 	if len(thisFailures) == 0 {
 		r.Status = cache.ResultFailed
+		// We add a "flake" just to make sure this appears in the flake
+		// cache as something that needs to be synced.
+		r.Flakes = map[cache.Test]string{
+			cache.RunBrokenTestName: "Unable to get data-- please look at the logs",
+		}
 		return r, nil
 	}
 
@@ -174,12 +166,17 @@ func (e *RealE2ETester) getGCSResult(j cache.Job, n cache.Number) (*cache.Result
 func (e *RealE2ETester) GCSBasedStable() (allStable, ignorableFlakes bool) {
 	allStable = true
 
-	for _, job := range e.JobNames {
+	for _, job := range e.BlockingJobNames {
 		lastBuildNumber, err := e.GoogleGCSBucketUtils.GetLastestBuildNumberFromJenkinsGoogleBucket(job)
 		glog.V(4).Infof("Checking status of %v, %v", job, lastBuildNumber)
 		if err != nil {
 			glog.Errorf("Error while getting data for %v: %v", job, err)
 			e.setBuildStatus(job, "Not Stable", strconv.Itoa(lastBuildNumber))
+			continue
+		}
+
+		if e.resolutionTracker.Resolved(cache.Job(job), cache.Number(lastBuildNumber)) {
+			e.setBuildStatus(job, "Problem Resolved", strconv.Itoa(lastBuildNumber))
 			continue
 		}
 
@@ -227,6 +224,23 @@ func (e *RealE2ETester) GCSBasedStable() (allStable, ignorableFlakes bool) {
 		e.setBuildStatus(job, "Not Stable", strconv.Itoa(lastBuildNumber))
 	}
 
+	// Also get status for non-blocking jobs
+	for _, job := range e.NonBlockingJobNames {
+		lastBuildNumber, err := e.GoogleGCSBucketUtils.GetLastestBuildNumberFromJenkinsGoogleBucket(job)
+		glog.V(4).Infof("Checking status of %v, %v", job, lastBuildNumber)
+		if err != nil {
+			glog.Errorf("Error while getting data for %v: %v", job, err)
+			e.setBuildStatus(job, "[nonblocking] Not Stable", strconv.Itoa(lastBuildNumber))
+			continue
+		}
+
+		if thisResult, err := e.GetBuildResult(job, lastBuildNumber); err != nil || thisResult.Status != cache.ResultStable {
+			e.setBuildStatus(job, "[nonblocking] Not Stable", strconv.Itoa(lastBuildNumber))
+		} else {
+			e.setBuildStatus(job, "[nonblocking] Stable", strconv.Itoa(lastBuildNumber))
+		}
+	}
+
 	return allStable, ignorableFlakes
 }
 
@@ -241,21 +255,37 @@ func getJUnitFailures(r io.Reader) (failures map[string]string, err error) {
 		FailCount int        `xml:"failures,attr"`
 		Testcases []Testcase `xml:"testcase"`
 	}
-	ts := &Testsuite{}
-	// TODO: this full parse is a bit slower than the old scanf routine--
-	// could switch back for the case where we only care whether there was
-	// a failure or not if that is an issue in practice.
-	err = xml.NewDecoder(r).Decode(ts)
+	type Testsuites struct {
+		TestSuites []Testsuite `xml:"testsuite"`
+	}
+	var testSuiteList []Testsuite
+	failures = map[string]string{}
+	testSuites := &Testsuites{}
+	testSuite := &Testsuite{}
+	b, err := ioutil.ReadAll(r)
 	if err != nil {
 		return failures, err
 	}
-	if ts.FailCount == 0 {
-		return nil, nil
+	// first try to parse the result with <testsuites> as top tag
+	err = xml.Unmarshal(b, testSuites)
+	if err == nil && len(testSuites.TestSuites) > 0 {
+		testSuiteList = testSuites.TestSuites
+	} else {
+		// second try to parse the result with <testsuite> as top tag
+		err = xml.Unmarshal(b, testSuite)
+		if err != nil {
+			return nil, err
+		}
+		testSuiteList = []Testsuite{*testSuite}
 	}
-	failures = map[string]string{}
-	for _, tc := range ts.Testcases {
-		if tc.Failure != "" {
-			failures[fmt.Sprintf("%v {%v}", tc.Name, tc.ClassName)] = tc.Failure
+	for _, ts := range testSuiteList {
+		if ts.FailCount == 0 {
+			continue
+		}
+		for _, tc := range ts.Testcases {
+			if tc.Failure != "" {
+				failures[fmt.Sprintf("%v {%v}", tc.Name, tc.ClassName)] = tc.Failure
+			}
 		}
 	}
 	return failures, nil
@@ -324,6 +354,11 @@ func (e *RealE2ETester) GCSWeakStable() bool {
 		}
 		if stable, err := e.GoogleGCSBucketUtils.CheckFinishedStatus(job, lastBuildNumber); stable && err == nil {
 			e.setBuildStatus(job, "Stable", strconv.Itoa(lastBuildNumber))
+			continue
+		}
+
+		if e.resolutionTracker.Resolved(cache.Job(job), cache.Number(lastBuildNumber)) {
+			e.setBuildStatus(job, "Problem Resolved", strconv.Itoa(lastBuildNumber))
 			continue
 		}
 

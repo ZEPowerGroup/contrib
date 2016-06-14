@@ -10,7 +10,6 @@ app.controller('SQCntl', ['DataService', '$interval', '$location', SQCntl]);
 function SQCntl(dataService, $interval, $location) {
   var self = this;
   self.prs = {};
-  self.users = {};
   self.builds = {};
   self.health = {};
   self.lastMergeTime = Date();
@@ -68,7 +67,6 @@ function SQCntl(dataService, $interval, $location) {
     reloadFunctions[refreshSQStats] = 30;
     reloadFunctions[refreshHistoryPRs] = 1;
     reloadFunctions[refreshE2EHealth] = 10;
-    reloadFunctions[refreshUsers] = 15;
     reloadFunctions[refreshBotStats] = 10;
 
     // tabFunctionReloads is a map of which tabs need which functions to refresh
@@ -77,7 +75,7 @@ function SQCntl(dataService, $interval, $location) {
       1: [refreshGithubE2E, refreshSQStats],
       2: [refreshHistoryPRs],
       3: [refreshE2EHealth, refreshSQStats],
-      4: [refreshSQStats, refreshUsers, refreshBotStats],
+      4: [refreshSQStats, refreshBotStats],
     }
     if (self.tabLoaded[self.selected]) {
       return;
@@ -160,12 +158,6 @@ function SQCntl(dataService, $interval, $location) {
     });
   }
 
-  function refreshUsers() {
-    dataService.getData('users').then(function successCallback(response) {
-      self.users = response.data;
-    });
-  }
-
   function refreshE2EHealth() {
     dataService.getData("health").then(function successCallback(response) {
       self.health = response.data;
@@ -194,20 +186,53 @@ function SQCntl(dataService, $interval, $location) {
         'name': key,
         'id': job.ID,
       };
-      if (job.Status == 'Stable') {
-        // green check mark
-        obj.state = '\u2713';
-        obj.color = 'green';
-      } else if (job.Status == 'Not Stable') {
-        // red X mark
-        obj.state = '\u2716';
-        obj.color = 'red';
-        failedBuild = true;
-      } else {
-        obj.state = 'Error';
-        obj.color = 'red';
-        obj.msg = job.Status;
-        failedBuild = true;
+      switch (job.Status) {
+        case 'Stable':
+          // green check mark
+          obj.state = '\u2713';
+          obj.color = 'green';
+          break;
+        case 'Not Stable':
+          // red X mark
+          obj.state = '\u2716';
+          obj.color = 'red';
+          failedBuild = true;
+          break;
+        case 'Ignorable flake':
+          // orange X mark
+          obj.state = '\u2716';
+          obj.color = 'orange';
+          obj.msg = 'Flake!';
+          break;
+        case 'Problem Resolved':
+          // orange X mark
+          obj.state = '\u2716';
+          obj.color = 'orange';
+          obj.msg = 'Manual override';
+          break;
+        case '[nonblocking] Stable':
+          // green check mark
+          obj.state = '\u2713';
+          obj.color = 'green';
+          obj.msg = '[nonblocking]';
+          break;
+        case '[nonblocking] Not Stable':
+          // orange X mark
+          obj.state = '\u2716';
+          obj.color = 'orange';
+          obj.msg = '[nonblocking]';
+          break;
+        case '[nonblocking] Ignorable flake':
+          // orange X mark
+          obj.state = '\u2716';
+          obj.color = 'orange';
+          obj.msg = '[nonblocking]';
+          break;
+        default:
+          obj.state = 'Error';
+          obj.color = 'red';
+          obj.msg = job.Status;
+          failedBuild = true;
       }
       obj.stability = '';
       result.push(obj);

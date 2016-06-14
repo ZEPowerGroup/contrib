@@ -124,7 +124,34 @@ func (p *FlakeManager) isIndividualFlake(f cache.Flake) bool {
 		return false
 	}
 
+	if len(f.Result.Flakes) > 0 {
+		// If this flake really represents an entire suite failure,
+		// this key will be present.
+		if _, ok := f.Result.Flakes[cache.RunBrokenTestName]; ok {
+			return false
+		}
+	}
+
 	return true
+}
+
+func (p *FlakeManager) listPreviousIssues(title string) []string {
+	s := []string{}
+	for _, i := range p.finder.AllIssuesForKey(title) {
+		s = append(s, fmt.Sprintf("#%v", i))
+	}
+	return s
+}
+
+// makeGubernatorLink returns a URL to view the build results in a GCS path.
+//
+// gcsPath should be a string like "/kubernetes-jenkins/logs/e2e/1234/",
+// pointing at a bucket and path containing test results for a given build.
+//
+// Gubernator is a simple frontend that reads test result buckets to improve
+// test triaging. Its source code is in kubernetes/test-infra/gubernator
+func makeGubernatorLink(gcsPath string) string {
+	return "https://k8s-gubernator.appspot.com/build" + gcsPath
 }
 
 type individualFlakeSource struct {
@@ -146,26 +173,20 @@ func (p *individualFlakeSource) ID() string {
 	return p.fm.googleGCSBucketUtils.GetPathToJenkinsGoogleBucket(
 		string(p.flake.Job),
 		int(p.flake.Number),
-		"",
 	) + "\n"
 }
 
 // Body implements IssueSource
 func (p *individualFlakeSource) Body(newIssue bool) string {
-	testName := string(p.flake.Test)
-	extraInfo := fmt.Sprintf("Failed: %v\n\n```\n%v\n```\n\n", testName, p.flake.Reason)
-	body := p.ID() + "\n" + extraInfo
+	extraInfo := fmt.Sprintf("Failed: %v\n\n```\n%v\n```\n\n", p.Title(), p.flake.Reason)
+	body := makeGubernatorLink(p.ID()) + "\n" + extraInfo
 
 	if !newIssue {
 		return body
 	}
 
 	// If we're filing a new issue, reference previous issues if we know of any.
-	if previousIssues := p.fm.finder.AllIssuesForKey(testName); len(previousIssues) > 0 {
-		s := []string{}
-		for _, i := range previousIssues {
-			s = append(s, fmt.Sprintf("#%v", i))
-		}
+	if s := p.fm.listPreviousIssues(p.Title()); len(s) > 0 {
 		body = body + fmt.Sprintf("\nPrevious issues for this test: %v\n", strings.Join(s, " "))
 	}
 	return body
@@ -183,13 +204,10 @@ type brokenJobSource struct {
 
 // Title implements IssueSource
 func (p *brokenJobSource) Title() string {
-	failures := "?"
-	if p.result.Status != cache.ResultFailed {
-		failures = fmt.Sprintf("%v", len(p.result.Flakes))
-	}
-
+	// Keep single issues for test builds and add comments when large
+	// batches of failures occur instead of making many issues.
 	// DO NOT CHANGE or it will not recognize previous entries!
-	return fmt.Sprintf("Broken test run: %v - %v [%v failures]", p.result.Job, p.result.Number, failures)
+	return fmt.Sprintf("%v: broken test run", p.result.Job)
 }
 
 // ID implements IssueSource
@@ -198,16 +216,16 @@ func (p *brokenJobSource) ID() string {
 	return p.fm.googleGCSBucketUtils.GetPathToJenkinsGoogleBucket(
 		string(p.result.Job),
 		int(p.result.Number),
-		"",
 	) + "\n"
 }
 
 // Body implements IssueSource
 func (p *brokenJobSource) Body(newIssue bool) string {
+	url := makeGubernatorLink(p.ID())
 	if p.result.Status == cache.ResultFailed {
-		return fmt.Sprintf("%v\nRun so broken it didn't make JUnit output!", p.ID())
+		return fmt.Sprintf("%v\nRun so broken it didn't make JUnit output!", url)
 	}
-	body := fmt.Sprintf("%v\nMultiple broken tests:\n\n", p.ID())
+	body := fmt.Sprintf("%v\nMultiple broken tests:\n\n", url)
 
 	sections := []string{}
 	for testName, reason := range p.result.Flakes {
@@ -223,7 +241,18 @@ func (p *brokenJobSource) Body(newIssue bool) string {
 		}
 		sections = append(sections, text)
 	}
-	return body + strings.Join(sections, "\n\n")
+
+	body = body + strings.Join(sections, "\n\n")
+
+	if !newIssue {
+		return body
+	}
+
+	// If we're filing a new issue, reference previous issues if we know of any.
+	if s := p.fm.listPreviousIssues(p.Title()); len(s) > 0 {
+		body = body + fmt.Sprintf("\nPrevious issues for this suite: %v\n", strings.Join(s, " "))
+	}
+	return body
 }
 
 // Labels implements IssueSource

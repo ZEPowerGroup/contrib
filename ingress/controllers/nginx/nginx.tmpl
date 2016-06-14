@@ -16,7 +16,16 @@ events {
 }
 
 http {
-    {{ if $cfg.enableVtsStatus}}vhost_traffic_status_zone shared:vhost_traffic_status:{{ $cfg.vtsStatusZoneSize }};{{ end }}
+    {{/* databases used to determine the country depending on the client IP address */}}
+    {{/* http://nginx.org/en/docs/http/ngx_http_geoip_module.html */}}
+    {{/* this is require to calculate traffic for individual country using GeoIP in the status page */}}
+    geoip_country       /etc/nginx/GeoIP.dat;
+    geoip_city          /etc/nginx/GeoLiteCity.dat;
+
+    {{- if $cfg.enableVtsStatus }}
+    vhost_traffic_status_zone shared:vhost_traffic_status:{{ $cfg.vtsStatusZoneSize }};
+    vhost_traffic_status_filter_by_set_key $geoip_country_code country::*;
+    {{ end -}}
 
     # lus sectrion to return proper error codes when custom pages are used
     lua_package_path '.?.lua;./etc/nginx/lua/?.lua;/etc/nginx/lua/vendor/lua-resty-http/lib/?.lua;';
@@ -41,22 +50,21 @@ http {
 
     include /etc/nginx/mime.types;
     default_type text/html;
-    {{ if $cfg.useGzip }}
+    {{ if $cfg.useGzip -}}
     gzip on;
     gzip_comp_level 5;
     gzip_http_version 1.1;
     gzip_min_length 256;
     gzip_types {{ $cfg.gzipTypes }};    
     gzip_proxied any;
-    gzip_vary on;
-    {{ end }}
+    {{- end }}
 
     client_max_body_size "{{ $cfg.bodySize }}";
 
-    {{ if $cfg.useProxyProtocol }}
+    {{ if $cfg.useProxyProtocol -}}
     set_real_ip_from    {{ $cfg.proxyRealIpCidr }};
     real_ip_header      proxy_protocol;
-    {{ end }}
+    {{ end -}}
 
     log_format upstreaminfo '{{ if $cfg.useProxyProtocol }}$proxy_protocol_addr{{ else }}$remote_addr{{ end }} - '
         '[$proxy_add_x_forwarded_for] - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent" '
@@ -126,26 +134,31 @@ http {
     {{- if .customErrors }}
     # Custom error pages
     proxy_intercept_errors on;
-    {{ end -}}
-
-    {{- range $errCode := $cfg.customHttpErrors }}
-    error_page {{ $errCode }} = @custom_{{ $errCode }};
     {{ end }}
 
+    {{- range $errCode := $cfg.customHttpErrors }}
+    error_page {{ $errCode }} = @custom_{{ $errCode }};{{ end }}
+
     # In case of errors try the next upstream server before returning an error
-    proxy_next_upstream                     error timeout invalid_header http_502 http_503 http_504 {{ if $cfg.retryNonIdempotent }}non_idempotent{{ end }};
+    proxy_next_upstream                     error timeout invalid_header http_502 http_503 http_504{{ if $cfg.retryNonIdempotent }} non_idempotent{{ end }};
 
     {{range $name, $upstream := .upstreams}}
     upstream {{$upstream.Name}} {
-        {{ if $cfg.enableStickySessions }}
+        {{ if $cfg.enableStickySessions -}}
         sticky hash=sha1 httponly;
-        {{ else }}
+        {{ else -}}
         least_conn;
-        {{ end }}
-        {{ range $server := $upstream.Backends }}server {{ $server.Address }}:{{ $server.Port }};
+        {{- end }}
+        {{ range $server := $upstream.Backends }}server {{ $server.Address }}:{{ $server.Port }} max_fails={{ $server.MaxFails }} fail_timeout={{ $server.FailTimeout }};
         {{ end }}
     }
-    {{end}}
+    {{ end }}
+
+    {{/* build all the required rate limit zones. Each annotation requires a dedicated zone */}}
+    {{/* 1MB -> 16 thousand 64-byte states or about 8 thousand 128-byte states */}}
+    {{- range $zone := (buildRateLimitZones .servers) }}
+    {{ $zone }}
+    {{ end }}
 
     {{ range $server := .servers }}
     server {
@@ -155,18 +168,46 @@ http {
         {{/* comment PEM sha is required to detect changes in the generated configuration and force a reload */}}
         # PEM sha: {{ $server.SSLPemChecksum }}        
         ssl_certificate {{ $server.SSLCertificate }};
-        ssl_certificate_key {{ $server.SSLCertificateKey }};{{ end }}
+        ssl_certificate_key {{ $server.SSLCertificateKey }};
+        {{- end }}
 
-        {{ if (and $server.SSL $cfg.hsts) }}
-        if ($scheme = http) {
-            return 301 https://$host$request_uri;
-        }
-
+        {{ if (and $server.SSL $cfg.hsts) -}}
         more_set_headers                            "Strict-Transport-Security: max-age={{ $cfg.hstsMaxAge }}{{ if $cfg.hstsIncludeSubdomains }}; includeSubDomains{{ end }}; preload";
-        {{ end }}
+        {{- end }}
 
-        {{ range $location := $server.Locations }}
-        location {{ $location.Path }} {
+        {{ if $cfg.enableVtsStatus }}vhost_traffic_status_filter_by_set_key $geoip_country_code country::$server_name;{{ end }}
+
+        {{- range $location := $server.Locations }}
+        {{ $path := buildLocation $location }}
+        location {{ $path }} {
+            {{ if gt (len $location.Whitelist.CIDR) 0 }}
+            {{- range $ip := $location.Whitelist.CIDR }}
+            allow {{ $ip }};{{ end }}
+            deny all;
+            {{ end -}}
+
+            {{ if (and $server.SSL $location.Redirect.SSLRedirect) -}}
+            # enforce ssl on server side
+            if ($scheme = http) {
+                return 301 https://$host$request_uri;
+            }
+            {{- end }}
+            {{/* if the location contains a rate limit annotation, create one */}}
+            {{ $limits := buildRateLimit $location }}
+            {{- range $limit := $limits }}
+            {{ $limit }}{{ end }}
+
+            {{ if $location.Auth.Secured }}
+            {{ if eq $location.Auth.Type "basic" }}
+            auth_basic "{{ $location.Auth.Realm }}";
+            auth_basic_user_file {{ $location.Auth.File }};
+            {{ else }}
+            #TODO: add nginx-http-auth-digest module
+            auth_digest "{{ $location.Auth.Realm }}";
+            auth_digest_user_file {{ $location.Auth.File }};
+            {{ end }}
+            {{- end }}
+
             proxy_set_header Host                   $host;
 
             # Pass Real IP
@@ -190,7 +231,12 @@ http {
 
             proxy_http_version                      1.1;
 
-            proxy_pass http://{{ $location.Upstream.Name }};
+            {{/* rewrite only works if the content is not compressed */}}
+            {{ if $location.Redirect.AddBaseURL -}}
+            proxy_set_header                        Accept-Encoding     "";
+            {{- end }}
+
+            {{- buildProxyPass $location }}
         }
         {{ end }}
 
@@ -219,13 +265,13 @@ http {
         }
        
         location /nginx_status {
-            {{ if $cfg.enableVtsStatus }}
+            {{ if $cfg.enableVtsStatus -}}
             vhost_traffic_status_display;
             vhost_traffic_status_display_format html;
             {{ else }}
             access_log off;
             stub_status on;
-            {{ end }}
+            {{- end }}
         }
 
         location / {

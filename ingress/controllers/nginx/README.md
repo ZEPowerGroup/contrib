@@ -131,6 +131,11 @@ To disable this behavior use `hsts=false` in the NGINX ConfigMap.
 
 NGINX provides the configuration option [ssl_buffer_size](http://nginx.org/en/docs/http/ngx_http_ssl_module.html#ssl_buffer_size) to allow the optimization of the TLS record size. This improves the [Time To First Byte](https://www.igvita.com/2013/12/16/optimizing-nginx-tls-time-to-first-byte/) (TTTFB). The default value in the Ingress controller is `4k` (nginx default is `16k`);
 
+### Server-side HTTPS enforcement through redirect
+
+By default the controller redirects (301) to HTTPS if TLS is enabled for that ingress . If you want to disable that behaviour globally, you can use `ssl-redirect: "false"` in the NGINX ConfigMap.
+
+To configure this feature for specfic ingress resources, you can use the `ingress.kubernetes.io/ssl-redirect: "false"` annotation in theparticular resource.
 
 ## Proxy Protocol
 
@@ -196,6 +201,46 @@ Use the [custom-template](examples/custom-template/README.md) example as a guide
 **Please note the template is tied to the go code. Be sure to no change names in the variable `$cfg`**
 
 
+### Custom NGINX upstream checks
+
+NGINX exposes some flags in the [upstream configuration](http://nginx.org/en/docs/http/ngx_http_upstream_module.html#upstream) that enabled configuration of each server in the upstream. The ingress controller allows custom `max_fails` and `fail_timeout` parameters in a global context using `upstream-max-fails` or `upstream-fail-timeout` in the NGINX Configmap or in a particular Ingress rule. By default this values are 0. This means NGINX will respect the `livenessProbe`, if is defined. If there is no probe, NGINX will not mark a server inside an upstream down.
+
+To use custom values in an Ingress rule define this annotations:
+
+`ingress-nginx.kubernetes.io/upstream-max-fails`: number of unsuccessful attempts to communicate with the server that should happen in the duration set by the fail_timeout parameter to consider the server unavailable
+
+`ingress-nginx.kubernetes.io/upstream-fail-timeout`: time in seconds during which the specified number of unsuccessful attempts to communicate with the server should happen to consider the server unavailable. Also the period of time the server will be considered unavailable.
+
+**Important:** 
+The upstreams are shared. i.e. Ingress rule using the same service will use the same upstream. 
+This means only one of the rules should define annotations to configure the upstream servers
+
+
+Please check the [auth](examples/custom-upstream-check/README.md) example
+
+ ### Authentication
+ 
+ Is possible to add authentication adding additional annotations in the Ingress rule. The source of the authentication is a secret that contains usernames and passwords inside the the key `auth`
+ 
+ The annotations are:
+ 
+ ```
+ ingress-nginx.kubernetes.io/auth-type:[basic|digest]
+ ```
+ 
+ Indicates the [HTTP Authentication Type: Basic or Digest Access Authentication](https://tools.ietf.org/html/rfc2617).
+ 
+ ```
+ ingress-nginx.kubernetes.io/auth-secret:secretName
+ ```
+ 
+ Name of the secret that contains the usernames and passwords with access to the `path/s` defined in the Ingress Rule.
+ The secret must be created in the same namespace than the Ingress rule
+ 
+ ```
+ ingress-nginx.kubernetes.io/auth-realm:"realm string"
+ ```
+
 
 ### NGINX status page
 
@@ -207,7 +252,6 @@ Please check the example `example/rc-default.yaml`
 ![nginx-module-vts screenshot](https://cloud.githubusercontent.com/assets/3648408/10876811/77a67b70-8183-11e5-9924-6a6d0c5dc73a.png "screenshot with filter")
 
 To extract the information in JSON format the module provides a custom URL: `/nginx_status/format/json`
-
 
 
 ### Custom errors
@@ -261,4 +305,3 @@ The previous behavior can be restored using `retry-non-idempotent=true` in the c
 
 - Ingress rules for TLS require the definition of the field `host`
 - The IP address in the status of loadBalancer could contain old values
-

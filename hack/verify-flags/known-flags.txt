@@ -1,3 +1,4 @@
+admin-port
 allowed-shame-domains
 api-token
 balance-algorithm
@@ -5,6 +6,7 @@ block-path-config
 blunderbuss-config
 blunderbuss-reassign
 change-permissions
+cloud-config
 cluster-uid
 configuration-name
 current-release-pr
@@ -24,7 +26,6 @@ error-page
 etcd-prefix
 etcd-server
 etcd-servers
-experimental-scale-down-enabled
 extra-cpu
 extra-memory
 extra-storage
@@ -48,6 +49,7 @@ max-pr-number
 max-sync-failures
 min-pr-number
 network-config
+nonblocking-jenkins-jobs
 nginx-configmap
 number-of-old-test-results
 on-change
@@ -63,14 +65,18 @@ required-contexts
 right-build-number
 running-in-cluster
 scale-down-delay
-scale-down-trial-frequency
-scale-down-underutilized-time
+scale-down-enabled
+scale-down-trial-interval
+scale-down-unneeded-time
 scale-down-utilization-threshold
+scan-interval
 services-configmap
 shame-cc
 shame-from
 shame-reply-to
 shame-report-cmd
+skip-nodes-with-system-pods
+skip-nodes-with-local-storage
 source-file
 ssl-ca-cert
 ssl-cert
@@ -97,3 +103,5 @@ watch-namespace
 weak-stable-jobs
 whitelist-override-label
 config-file-path
+required-retest-contexts
+retest-body
